@@ -3,6 +3,9 @@ import tkinter as tk
 from tkinter import messagebox
 import math
 
+connection = sqlite3.connect("family_tree.db")
+cursor = connection.cursor()
+
 last_view_position = None
 last_tree_geometry = None
 current_tree_window = None
@@ -14,8 +17,16 @@ tree_positions = {}
 pan_start_x = 0
 pan_start_y = 0
 
-connection = sqlite3.connect("family_tree.db")
-cursor = connection.cursor()
+drag_threshold = 5  # pixels of wiggle room before it counts as a real drag
+
+add_person_collapsed = False
+ADD_PERSON_EXPANDED_HEIGHT = 420
+ADD_PERSON_COLLAPSED_HEIGHT = 30
+
+search_list_collapsed = False
+SEARCH_LIST_HEADER_HEIGHT = 30
+
+current_info_person_id = None
 
 cursor.execute("""
     CREATE TABLE IF NOT EXISTS people (
@@ -42,6 +53,42 @@ cursor.execute("""
 
 connection.commit()
 
+def toggle_add_person():
+    global add_person_collapsed
+    add_person_collapsed = not add_person_collapsed
+
+    if add_person_collapsed:
+        add_person_content.pack_forget()
+        add_person_frame.place(x=10, y=10, width=260, height=ADD_PERSON_COLLAPSED_HEIGHT)
+        toggle_add_person_btn.config(text="▼")
+    else:
+        add_person_frame.place(x=10, y=10, width=260, height=ADD_PERSON_EXPANDED_HEIGHT)
+        add_person_content.pack(fill="both", expand=True)
+        toggle_add_person_btn.config(text="▲")
+
+    resize_search_list_frame()
+
+def toggle_search_list():
+    global search_list_collapsed
+    search_list_collapsed = not search_list_collapsed
+
+    if search_list_collapsed:
+        search_list_content.pack_forget()
+        toggle_search_list_btn.config(text="▼")
+    else:
+        search_list_content.pack(fill="both", expand=True)
+        toggle_search_list_btn.config(text="▲")
+
+    resize_search_list_frame()
+
+def resize_search_list_frame():
+    current_height = ADD_PERSON_COLLAPSED_HEIGHT if add_person_collapsed else ADD_PERSON_EXPANDED_HEIGHT
+    new_y = 10 + current_height + 10
+
+    if search_list_collapsed:
+        search_list_frame.place(x=10, y=new_y, width=260, relheight=0, height=SEARCH_LIST_HEADER_HEIGHT)
+    else:
+        search_list_frame.place(x=10, y=new_y, width=260, relheight=1, height=-(new_y + 10))
 
 def save_window_position():
     with open("window_position.txt", "w") as file:
@@ -181,6 +228,29 @@ def view_people():
             )
 
         spouse_menu_button.grid(row=row_index, column=len(headers) + 3)
+
+def update_info_panel(person_id):
+    global current_info_person_id
+    current_info_person_id = person_id
+
+    cursor.execute("SELECT first_name, last_name, birth_date, death_date, sex, notes FROM people WHERE id = ?", (person_id,))
+    result = cursor.fetchone()
+    if not result:
+        return
+    first_name, last_name, birth_date, death_date, sex, notes = result
+
+    info_frame.place(relx=1.0, x=-390, y=10, width=380, relheight=1, height=-20)
+
+    info_name_label.config(text=f"{first_name} {last_name}")
+    info_born_label.config(text=f"Born: {birth_date or '—'}")
+    info_died_label.config(text=f"Died: {death_date or '—'}")
+    info_sex_label.config(text=f"Sex: {sex or '—'}")
+    info_notes_label.config(text=notes or "—")
+
+def clear_info_panel():
+    global current_info_person_id
+    current_info_person_id = None
+    info_frame.place_forget()
 
 def open_edit_window(person_id, view_window):
     cursor.execute("SELECT first_name, last_name, birth_date, death_date, sex, notes FROM people WHERE id = ?", (person_id,))
@@ -342,43 +412,98 @@ def calculate_positions():
 
     return positions
 
+def focus_on_person(person_id):
+    global tree_pan_x, tree_pan_y
+
+    if person_id not in tree_positions:
+        return
+
+    logical_x, logical_y = tree_positions[person_id]
+
+    canvas_width = canvas.winfo_width()
+    canvas_height = canvas.winfo_height()
+
+    tree_pan_x = (canvas_width / 2) - (logical_x * tree_zoom)
+    tree_pan_y = (canvas_height / 2) - (logical_y * tree_zoom)
+
+    draw_tree()
+    open_radial_menu(canvas, person_id)
+    update_info_panel(person_id)
+
+def refresh_sidebar_list(filter_text=""):
+    for widget in sidebar_list_inner.winfo_children():
+        widget.destroy()
+
+    cursor.execute("SELECT id, first_name, last_name FROM people ORDER BY first_name")
+    people = cursor.fetchall()
+
+    filter_text = filter_text.strip().lower()
+
+    for person_id, first_name, last_name in people:
+        full_name = f"{first_name} {last_name}"
+        if filter_text and filter_text not in full_name.lower():
+            continue
+
+        row = tk.Label(
+            sidebar_list_inner, text=full_name, bg="white",
+            anchor="w", padx=8, pady=4, cursor="hand2"
+        )
+        row.pack(fill="x")
+        row.bind("<Button-1>", lambda event, pid=person_id: focus_on_person(pid))
+
+def on_search_typed(event):
+    refresh_sidebar_list(search_entry.get())
+
 def open_tree_view():
-    global current_tree_window, tree_canvas, tree_positions, tree_zoom, tree_pan_x, tree_pan_y
-
-    tree_window = tk.Toplevel(window)
-    tree_window.title("Family Tree")
-    current_tree_window = tree_window
-
-    if last_tree_geometry:
-        tree_window.geometry(last_tree_geometry)
-    else:
-        open_near_main(tree_window)
-        tree_window.geometry("800x600")
-
-    def on_close():
-        global last_tree_geometry
-        last_tree_geometry = tree_window.geometry()
-        tree_window.destroy()
-
-    tree_window.protocol("WM_DELETE_WINDOW", on_close)
-
-    canvas = tk.Canvas(tree_window, bg="white")
-    canvas.pack(fill="both", expand=True)
-    canvas.bind("<Button-1>", lambda event: clear_radial_menu(canvas), add="+")
-    tree_canvas = canvas
+    global tree_positions, tree_zoom, tree_pan_x, tree_pan_y
 
     tree_positions = calculate_positions()
-    xs = [pos[0] for pos in tree_positions.values()]
-    if xs:
-        tree_pan_x = 400 - (min(xs) + max(xs)) / 2
-    else:
-        tree_pan_x = 0
+    center_tree()
 
     canvas.bind("<MouseWheel>", zoom)
-    canvas.bind("<ButtonPress-1>", start_pan)
+    canvas.bind("<ButtonPress-1>", on_canvas_press)
     canvas.bind("<B1-Motion>", do_pan)
 
     draw_tree()
+
+def center_tree():
+    global tree_pan_x, tree_pan_y
+
+    if not tree_positions:
+        tree_pan_x = 0
+        tree_pan_y = 0
+        return
+
+    xs = [pos[0] for pos in tree_positions.values()]
+    ys = [pos[1] for pos in tree_positions.values()]
+    mid_x = (min(xs) + max(xs)) / 2
+    mid_y = (min(ys) + max(ys)) / 2
+
+    canvas.update_idletasks()  # forces Tkinter to calculate real window size before we read it
+    canvas_width = canvas.winfo_width()
+    canvas_height = canvas.winfo_height()
+
+    tree_pan_x = (canvas_width / 2) - (mid_x * tree_zoom)
+    tree_pan_y = (canvas_height / 2) - (mid_y * tree_zoom)
+
+def on_canvas_press(event):
+    global pan_start_x, pan_start_y, click_start_x, click_start_y
+
+    clicked_items = canvas.find_withtag("current")
+    clicked_a_person = False
+    if clicked_items:
+        tags = canvas.gettags(clicked_items[0])
+        if any(tag.startswith("person_") for tag in tags):
+            clicked_a_person = True
+
+    if not clicked_a_person:
+        clear_radial_menu(canvas)
+        clear_info_panel()
+
+    pan_start_x = event.x - tree_pan_x
+    pan_start_y = event.y - tree_pan_y
+    click_start_x = event.x
+    click_start_y = event.y
 
 def get_screen_position(person_id):
     logical_x, logical_y = tree_positions[person_id]
@@ -387,26 +512,65 @@ def get_screen_position(person_id):
     return screen_x, screen_y
 
 def draw_tree():
-    canvas = tree_canvas
     canvas.delete("all")
 
     radius = 40 * tree_zoom
 
-    cursor.execute("SELECT person_id, related_person_id FROM relationships WHERE relationship_type = 'parent'")
-    parent_links = cursor.fetchall()
-    for child_id, parent_id in parent_links:
-        if child_id in tree_positions and parent_id in tree_positions:
-            x1, y1 = get_screen_position(parent_id)
-            x2, y2 = get_screen_position(child_id)
-            canvas.create_line(x1, y1, x2, y2, fill="black", width=2)
-
     cursor.execute("SELECT person_id, related_person_id FROM relationships WHERE relationship_type = 'spouse'")
     spouse_links = cursor.fetchall()
+
+    drawn_spouse_pairs = set()
     for person_id, spouse_id in spouse_links:
+        pair = frozenset((person_id, spouse_id))
+        if pair in drawn_spouse_pairs:
+            continue
+        drawn_spouse_pairs.add(pair)
         if person_id in tree_positions and spouse_id in tree_positions:
             x1, y1 = get_screen_position(person_id)
             x2, y2 = get_screen_position(spouse_id)
-            canvas.create_line(x1, y1, x2, y2, fill="red", width=2, dash=(4, 2))
+            canvas.create_line(x1, y1, x2, y2, fill="#d17b7b", width=2, dash=(4, 2))
+
+    cursor.execute("SELECT person_id, related_person_id FROM relationships WHERE relationship_type = 'parent'")
+    parent_links = cursor.fetchall()
+
+    parents_of = {}
+    for child_id, parent_id in parent_links:
+        parents_of.setdefault(child_id, set()).add(parent_id)
+
+    children_of_couple = {}
+    for child_id, parent_ids in parents_of.items():
+        couple_key = frozenset(parent_ids)
+        children_of_couple.setdefault(couple_key, []).append(child_id)
+
+    for couple_key, children in children_of_couple.items():
+        parent_positions = [get_screen_position(pid) for pid in couple_key if pid in tree_positions]
+        if not parent_positions:
+            continue
+
+        anchor_x = sum(p[0] for p in parent_positions) / len(parent_positions)
+        anchor_y = sum(p[1] for p in parent_positions) / len(parent_positions)
+
+        child_positions = [(cid, get_screen_position(cid)) for cid in children if cid in tree_positions]
+        if not child_positions:
+            continue
+
+        bus_y = anchor_y + (child_positions[0][1][1] - anchor_y) / 2
+
+        line_color = "#8a8a8a"
+        line_width = 2
+
+        for cid, (cx, cy) in child_positions:
+            points = [
+                anchor_x, anchor_y,
+                anchor_x, bus_y,
+                cx, bus_y,
+                cx, cy
+            ]
+            canvas.create_line(
+                *points,
+                fill=line_color, width=line_width,
+                capstyle="round", smooth=True, splinesteps=12
+            )
 
     cursor.execute("SELECT id, first_name, last_name, sex FROM people")
     people = cursor.fetchall()
@@ -441,29 +605,22 @@ def zoom(event):
 
     draw_tree()
 
-def start_pan(event):
-    global pan_start_x, pan_start_y
-    pan_start_x = event.x - tree_pan_x
-    pan_start_y = event.y - tree_pan_y
-
 def do_pan(event):
     global tree_pan_x, tree_pan_y
+
+    if abs(event.x - click_start_x) < drag_threshold and abs(event.y - click_start_y) < drag_threshold:
+        return  # still just a click, not an intentional drag
+
     tree_pan_x = event.x - pan_start_x
     tree_pan_y = event.y - pan_start_y
     draw_tree()
 
 def refresh_tree():
-    global current_tree_window, last_tree_geometry
-    if current_tree_window is not None and current_tree_window.winfo_exists():
-        last_tree_geometry = current_tree_window.geometry()
-        current_tree_window.destroy()
-        open_tree_view()
-
-def clear_radial_menu(canvas):
-    canvas.delete("radial_menu")
+    draw_tree()
+    refresh_sidebar_list(search_entry.get())
 
 def handle_radial_action(person_id, action):
-    clear_radial_menu(tree_canvas)
+    clear_radial_menu(canvas)
     if action == "add_child":
         open_add_child_window(person_id)
     elif action == "add_parent":
@@ -479,9 +636,10 @@ def handle_radial_action(person_id, action):
 
 def open_radial_menu(canvas, person_id):
     clear_radial_menu(canvas)
+    update_info_panel(person_id)
 
     x, y = get_screen_position(person_id)
-    outer_radius = 100
+    outer_radius = 100 * tree_zoom
 
     labels = ["Add Spouse", "Add Parents", "View Details", "Deleting", "Settings", "Add Children"]
     actions = ["add_spouse", "add_parent", "view_details", "delete", "settings", "add_child"]
@@ -508,7 +666,7 @@ def open_radial_menu(canvas, person_id):
 
         canvas.create_text(
             label_x, label_y, text=labels[i],
-            font=("Arial", 8), width=55,
+            font=("Arial", max(6, int(8 * tree_zoom))), width=int(55 * tree_zoom),
             justify="center",
             tags=("radial_menu",)
         )
@@ -516,24 +674,8 @@ def open_radial_menu(canvas, person_id):
         canvas.tag_bind(tag, "<Button-1>", lambda event, pid=person_id, act=actions[i]: handle_radial_action(pid, act))
     canvas.tag_raise(f"person_{person_id}")
 
-    person_radius = 40 * tree_zoom
-    strip_height = 19 * tree_zoom
-    strip_width = person_radius * 1.2
-    edit_tag = f"edit_{person_id}"
-
-    canvas.create_rectangle(
-        x - strip_width / 2, y + person_radius - strip_height - 2,
-        x + strip_width / 2, y + person_radius - 4,
-        fill="white", outline="black",
-        tags=("radial_menu", edit_tag)
-    )
-    canvas.create_text(
-        x, y + person_radius - strip_height / 2 - 4, text="Edit",
-        font=("Arial", 8),
-        tags=("radial_menu", edit_tag)
-    )
-    
-    canvas.tag_bind(edit_tag, "<Button-1>", lambda event, pid=person_id: open_edit_window_from_tree(pid))
+def clear_radial_menu(canvas):
+    canvas.delete("radial_menu")
 
 def open_add_spouse_window(person_id):
     add_window = tk.Toplevel(window)
@@ -865,41 +1007,141 @@ def open_edit_window_from_tree(person_id):
 
     tk.Button(edit_window, text="Save Changes", command=save_edit).grid(row=len(labels), column=0, columnspan=2)
 
+def pop_out_info():
+    if current_info_person_id is None:
+        return
+
+    cursor.execute("SELECT first_name, last_name, birth_date, death_date, sex, notes FROM people WHERE id = ?", (current_info_person_id,))
+    result = cursor.fetchone()
+    if not result:
+        return
+    first_name, last_name, birth_date, death_date, sex, notes = result
+
+    clear_info_panel()
+
+    popout = tk.Toplevel(window)
+    popout.attributes("-topmost", True)
+    popout.title(f"{first_name} {last_name}")
+    popout.configure(bg="#eeeeee")
+    popout.minsize(300, 250)
+
+    button_x = popout_button.winfo_rootx()
+    button_y = popout_button.winfo_rooty()
+    popout.geometry(f"300x250+{button_x - 310}+{button_y}")
+
+    tk.Label(popout, text=f"{first_name} {last_name}", font=("Arial", 14, "bold"), bg="#eeeeee").pack(anchor="w", padx=12, pady=(12, 6))
+    tk.Label(popout, text=f"Born: {birth_date or '—'}", bg="#eeeeee").pack(anchor="w", padx=12)
+    tk.Label(popout, text=f"Died: {death_date or '—'}", bg="#eeeeee").pack(anchor="w", padx=12)
+    tk.Label(popout, text=f"Sex: {sex or '—'}", bg="#eeeeee").pack(anchor="w", padx=12)
+    tk.Label(popout, text="Notes:", font=("Arial", 10, "bold"), bg="#eeeeee").pack(anchor="w", padx=12, pady=(12, 0))
+    tk.Label(popout, text=notes or "—", wraplength=350, justify="left", bg="#eeeeee").pack(anchor="w", padx=12, pady=(0, 12))
+
 window = tk.Tk()
 window.title("Family Tree")
+window.state("zoomed")
 
-tk.Label(window, text="First name").grid(row=0, column=0)
-first_name_entry = tk.Entry(window)
-first_name_entry.grid(row=0, column=1)
+canvas = tk.Canvas(window, bg="white")
+canvas.place(x=0, y=0, relwidth=1, relheight=1)
 
-tk.Label(window, text="Last name").grid(row=1, column=0)
-last_name_entry = tk.Entry(window)
-last_name_entry.grid(row=1, column=1)
+title_frame = tk.Frame(window, bg="#dddddd", bd=2, relief="solid")
+title_frame.place(relx=0.5, y=10, anchor="n", width=350, height=50)
+tk.Label(title_frame, text="Family Tree Name", font=("Arial", 14, "bold"), bg="#dddddd").pack(expand=True)
 
-tk.Label(window, text="Birth date (DD.MM.YYYY)").grid(row=2, column=0)
-birth_date_entry = tk.Entry(window)
-birth_date_entry.grid(row=2, column=1)
+add_person_frame = tk.Frame(window, bg="#eeeeee", bd=2, relief="solid")
+add_person_frame.place(x=10, y=10, width=260, height=ADD_PERSON_EXPANDED_HEIGHT)
 
-tk.Label(window, text="Death date (DD.MM.YYYY)").grid(row=3, column=0)
-death_date_entry = tk.Entry(window)
-death_date_entry.grid(row=3, column=1)
+add_person_header = tk.Frame(add_person_frame, bg="#dddddd")
+add_person_header.pack(fill="x")
+tk.Label(add_person_header, text="Add new Person", bg="#dddddd", font=("Arial", 10, "bold")).pack(side="left", padx=8, pady=4)
+toggle_add_person_btn = tk.Button(add_person_header, text="▲", width=2, command=toggle_add_person)
+toggle_add_person_btn.pack(side="right", padx=4)
 
-tk.Label(window, text="Sex (male/female/other)").grid(row=4, column=0)
-sex_entry = tk.Entry(window)
-sex_entry.grid(row=4, column=1)
+add_person_content = tk.Frame(add_person_frame, bg="#eeeeee")
+add_person_content.pack(fill="both", expand=True)
 
-tk.Label(window, text="Notes").grid(row=5, column=0)
-notes_entry = tk.Entry(window)
-notes_entry.grid(row=5, column=1)
+tk.Label(add_person_content, text="First name", bg="#eeeeee").pack(anchor="w", padx=8)
+first_name_entry = tk.Entry(add_person_content)
+first_name_entry.pack(fill="x", padx=8, pady=(0, 4))
 
-tk.Button(window, text="Save", command=save_person).grid(row=6, column=0, columnspan=2)
-tk.Button(window, text="View All", command=view_people).grid(row=7, column=0, columnspan=2)
-tk.Button(window, text="Family Tree", command=open_tree_view).grid(row=8, column=0, columnspan=2)
+tk.Label(add_person_content, text="Last name", bg="#eeeeee").pack(anchor="w", padx=8)
+last_name_entry = tk.Entry(add_person_content)
+last_name_entry.pack(fill="x", padx=8, pady=(0, 4))
 
-saved_position = load_window_position()
-if saved_position:
-    window.geometry(saved_position)
+tk.Label(add_person_content, text="Birth date (DD.MM.YYYY)", bg="#eeeeee").pack(anchor="w", padx=8)
+birth_date_entry = tk.Entry(add_person_content)
+birth_date_entry.pack(fill="x", padx=8, pady=(0, 4))
 
-window.protocol("WM_DELETE_WINDOW", lambda: (save_window_position(), window.destroy()))
+tk.Label(add_person_content, text="Death date (DD.MM.YYYY)", bg="#eeeeee").pack(anchor="w", padx=8)
+death_date_entry = tk.Entry(add_person_content)
+death_date_entry.pack(fill="x", padx=8, pady=(0, 4))
+
+tk.Label(add_person_content, text="Sex (male/female/other)", bg="#eeeeee").pack(anchor="w", padx=8)
+sex_entry = tk.Entry(add_person_content)
+sex_entry.pack(fill="x", padx=8, pady=(0, 4))
+
+tk.Label(add_person_content, text="Notes", bg="#eeeeee").pack(anchor="w", padx=8)
+notes_entry = tk.Entry(add_person_content)
+notes_entry.pack(fill="x", padx=8, pady=(0, 4))
+
+tk.Button(add_person_content, text="Save Person", command=save_person).pack(pady=8)
+
+search_list_frame = tk.Frame(window, bg="#eeeeee", bd=2, relief="solid")
+
+search_list_header = tk.Frame(search_list_frame, bg="#dddddd")
+search_list_header.pack(fill="x")
+tk.Label(search_list_header, text="All Characters", bg="#dddddd", font=("Arial", 10, "bold")).pack(side="left", padx=8, pady=4)
+toggle_search_list_btn = tk.Button(search_list_header, text="▲", width=2, command=toggle_search_list)
+toggle_search_list_btn.pack(side="right", padx=4)
+
+search_list_content = tk.Frame(search_list_frame, bg="#eeeeee")
+search_list_content.pack(fill="both", expand=True)
+
+search_entry = tk.Entry(search_list_content)
+search_entry.pack(fill="x", padx=8, pady=8)
+search_entry.bind("<KeyRelease>", on_search_typed)
+
+sidebar_canvas = tk.Canvas(search_list_content, bg="white", highlightthickness=0)
+sidebar_scrollbar = tk.Scrollbar(search_list_content, orient="vertical", command=sidebar_canvas.yview)
+sidebar_canvas.configure(yscrollcommand=sidebar_scrollbar.set)
+
+sidebar_scrollbar.pack(side="right", fill="y")
+sidebar_canvas.pack(side="left", fill="both", expand=True, padx=(8, 0), pady=(0, 8))
+
+sidebar_list_inner = tk.Frame(sidebar_canvas, bg="white")
+sidebar_canvas.create_window((0, 0), window=sidebar_list_inner, anchor="nw")
+
+def on_sidebar_list_configure(event):
+    sidebar_canvas.configure(scrollregion=sidebar_canvas.bbox("all"))
+
+sidebar_list_inner.bind("<Configure>", on_sidebar_list_configure)
+
+info_frame = tk.Frame(window, bg="#eeeeee", bd=2, relief="solid")
+
+info_header = tk.Frame(info_frame, bg="#dddddd")
+info_header.pack(fill="x")
+tk.Label(info_header, text="All Informations", bg="#dddddd", font=("Arial", 10, "bold")).pack(side="left", padx=8, pady=4)
+popout_button = tk.Button(info_header, text="⧉", width=2, command=pop_out_info)
+popout_button.pack(side="right", padx=4)
+
+info_name_label = tk.Label(info_frame, text="No one selected", bg="#eeeeee", font=("Arial", 14, "bold"))
+info_name_label.pack(anchor="w", padx=12, pady=(12, 6))
+
+info_born_label = tk.Label(info_frame, text="Born: —", bg="#eeeeee")
+info_born_label.pack(anchor="w", padx=12)
+
+info_died_label = tk.Label(info_frame, text="Died: —", bg="#eeeeee")
+info_died_label.pack(anchor="w", padx=12)
+
+info_sex_label = tk.Label(info_frame, text="Sex: —", bg="#eeeeee")
+info_sex_label.pack(anchor="w", padx=12)
+
+tk.Label(info_frame, text="Notes:", bg="#eeeeee", font=("Arial", 10, "bold")).pack(anchor="w", padx=12, pady=(12, 0))
+info_notes_label = tk.Label(info_frame, text="—", bg="#eeeeee", wraplength=350, justify="left")
+info_notes_label.pack(anchor="w", padx=12)
+
+window.update()
+open_tree_view()
+resize_search_list_frame()
+refresh_sidebar_list()
 
 window.mainloop()
