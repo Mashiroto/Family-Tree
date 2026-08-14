@@ -6,6 +6,7 @@ import math
 connection = sqlite3.connect("family_tree.db")
 cursor = connection.cursor()
 
+
 last_view_position = None
 last_tree_geometry = None
 current_tree_window = None
@@ -16,17 +17,15 @@ tree_canvas = None
 tree_positions = {}
 pan_start_x = 0
 pan_start_y = 0
-
-drag_threshold = 5  # pixels of wiggle room before it counts as a real drag
-
+drag_threshold = 5
 add_person_collapsed = False
 ADD_PERSON_EXPANDED_HEIGHT = 420
 ADD_PERSON_COLLAPSED_HEIGHT = 30
-
 search_list_collapsed = False
 SEARCH_LIST_HEADER_HEIGHT = 30
-
 current_info_person_id = None
+suppress_next_clear = False
+
 
 cursor.execute("""
     CREATE TABLE IF NOT EXISTS people (
@@ -118,6 +117,8 @@ def delete_person(person_id, view_window):
     view_people()
 
 def save_person():
+    global tree_positions
+
     add_person(
         first_name_entry.get(),
         last_name_entry.get(),
@@ -132,6 +133,10 @@ def save_person():
     death_date_entry.delete(0, tk.END)
     sex_entry.delete(0, tk.END)
     notes_entry.delete(0, tk.END)
+
+    tree_positions = calculate_positions()
+    draw_tree()
+    refresh_sidebar_list(search_entry.get())
 
 def toggle_parent(person_id, parent_id, var):
     if var.get():
@@ -487,18 +492,21 @@ def center_tree():
     tree_pan_y = (canvas_height / 2) - (mid_y * tree_zoom)
 
 def on_canvas_press(event):
-    global pan_start_x, pan_start_y, click_start_x, click_start_y
+    global pan_start_x, pan_start_y, click_start_x, click_start_y, suppress_next_clear
 
-    clicked_items = canvas.find_withtag("current")
-    clicked_a_person = False
-    if clicked_items:
-        tags = canvas.gettags(clicked_items[0])
-        if any(tag.startswith("person_") for tag in tags):
-            clicked_a_person = True
+    if suppress_next_clear:
+        suppress_next_clear = False
+    else:
+        clicked_items = canvas.find_withtag("current")
+        clicked_a_person = False
+        if clicked_items:
+            tags = canvas.gettags(clicked_items[0])
+            if any(tag.startswith("person_") for tag in tags):
+                clicked_a_person = True
 
-    if not clicked_a_person:
-        clear_radial_menu(canvas)
-        clear_info_panel()
+        if not clicked_a_person:
+            clear_radial_menu(canvas)
+            clear_info_panel()
 
     pan_start_x = event.x - tree_pan_x
     pan_start_y = event.y - tree_pan_y
@@ -589,6 +597,7 @@ def draw_tree():
         canvas.create_text(
             x, y, text=f"{first_name}\n{last_name}",
             font=("Arial", font_size),
+            justify="center",
             tags=(f"person_{person_id}", "person_shape")
         )
         canvas.tag_bind(f"person_{person_id}", "<Button-1>", lambda event, pid=person_id: open_radial_menu(canvas, pid))
@@ -616,10 +625,14 @@ def do_pan(event):
     draw_tree()
 
 def refresh_tree():
+    global tree_positions
+    tree_positions = calculate_positions()
     draw_tree()
     refresh_sidebar_list(search_entry.get())
 
 def handle_radial_action(person_id, action):
+    global suppress_next_clear
+    suppress_next_clear = True
     clear_radial_menu(canvas)
     if action == "add_child":
         open_add_child_window(person_id)
@@ -629,8 +642,11 @@ def handle_radial_action(person_id, action):
         open_add_spouse_window(person_id)
     elif action == "delete":
         delete_person_from_tree(person_id)
-    elif action == "view_details":
-        open_view_details_window(person_id)
+    elif action == "edit":
+        open_edit_window_from_tree(person_id)
+    elif action == "link":
+        x, y = get_screen_position(person_id)
+        open_link_window(person_id, x, y)
     else:
         print(f"Person {person_id}: {action}")
 
@@ -641,8 +657,8 @@ def open_radial_menu(canvas, person_id):
     x, y = get_screen_position(person_id)
     outer_radius = 100 * tree_zoom
 
-    labels = ["Add Spouse", "Add Parents", "View Details", "Deleting", "Settings", "Add Children"]
-    actions = ["add_spouse", "add_parent", "view_details", "delete", "settings", "add_child"]
+    labels = ["Add Spouse", "Add Parents", "Edit", "Deleting", "Link Unlink", "Add Children"]
+    actions = ["add_spouse", "add_parent", "edit", "delete", "link", "add_child"]
     angle_step = 360 / len(labels)
 
     for i in range(len(labels)):
@@ -666,9 +682,9 @@ def open_radial_menu(canvas, person_id):
 
         canvas.create_text(
             label_x, label_y, text=labels[i],
-            font=("Arial", max(6, int(8 * tree_zoom))), width=int(55 * tree_zoom),
+            font=("Arial", max(6, int(8 * tree_zoom))), width=int(45 * tree_zoom),
             justify="center",
-            tags=("radial_menu",)
+            tags=("radial_menu", tag)
         )
 
         canvas.tag_bind(tag, "<Button-1>", lambda event, pid=person_id, act=actions[i]: handle_radial_action(pid, act))
@@ -812,12 +828,17 @@ def open_add_parent_window(child_id):
         dropdown.grid(row=current_row, column=0)
 
         def link_existing():
+            if len(get_parent_ids(child_id)) >= 2:
+                messagebox.showinfo("Limit reached", "A person can only have 2 linked parents.")
+                return
+
             parent_id = int(selected_option.get().split(" - ")[0])
             cursor.execute("""
                 INSERT INTO relationships (person_id, related_person_id, relationship_type)
                 VALUES (?, ?, ?)
             """, (child_id, parent_id, "parent"))
             connection.commit()
+            auto_link_spouses_if_needed(child_id, parent_id)
             add_window.destroy()
             refresh_tree()
 
@@ -840,6 +861,10 @@ def open_add_parent_window(child_id):
         entries.append(entry)
 
     def save_new_parent():
+        if len(get_parent_ids(child_id)) >= 2:
+            messagebox.showinfo("Limit reached", "A person can only have 2 linked parents.")
+            return
+
         values = [entry.get() for entry in entries]
         cursor.execute("""
             INSERT INTO people (first_name, last_name, birth_date, death_date, sex, notes)
@@ -851,6 +876,7 @@ def open_add_parent_window(child_id):
             VALUES (?, ?, ?)
         """, (child_id, new_parent_id, "parent"))
         connection.commit()
+        auto_link_spouses_if_needed(child_id, new_parent_id)
         add_window.destroy()
         refresh_tree()
 
@@ -981,6 +1007,7 @@ def open_edit_window_from_tree(person_id):
     person = cursor.fetchone()
 
     edit_window = tk.Toplevel(window)
+    edit_window.attributes("-topmost", True)
     open_near_main(edit_window)
     edit_window.title("Edit Person")
 
@@ -1006,6 +1033,25 @@ def open_edit_window_from_tree(person_id):
         refresh_tree()
 
     tk.Button(edit_window, text="Save Changes", command=save_edit).grid(row=len(labels), column=0, columnspan=2)
+
+def auto_link_spouses_if_needed(child_id, new_parent_id):
+    cursor.execute("SELECT related_person_id FROM relationships WHERE person_id = ? AND relationship_type = 'parent'", (child_id,))
+    other_parent_ids = [row[0] for row in cursor.fetchall() if row[0] != new_parent_id]
+
+    for other_parent_id in other_parent_ids:
+        cursor.execute("""
+            SELECT 1 FROM relationships
+            WHERE relationship_type = 'spouse'
+            AND ((person_id = ? AND related_person_id = ?) OR (person_id = ? AND related_person_id = ?))
+        """, (new_parent_id, other_parent_id, other_parent_id, new_parent_id))
+        already_spouses = cursor.fetchone()
+
+        if not already_spouses:
+            cursor.execute("""
+                INSERT INTO relationships (person_id, related_person_id, relationship_type)
+                VALUES (?, ?, ?)
+            """, (new_parent_id, other_parent_id, "spouse"))
+            connection.commit()
 
 def pop_out_info():
     if current_info_person_id is None:
@@ -1035,6 +1081,222 @@ def pop_out_info():
     tk.Label(popout, text=f"Sex: {sex or '—'}", bg="#eeeeee").pack(anchor="w", padx=12)
     tk.Label(popout, text="Notes:", font=("Arial", 10, "bold"), bg="#eeeeee").pack(anchor="w", padx=12, pady=(12, 0))
     tk.Label(popout, text=notes or "—", wraplength=350, justify="left", bg="#eeeeee").pack(anchor="w", padx=12, pady=(0, 12))
+
+def on_sidebar_list_configure(event):
+    sidebar_canvas.configure(scrollregion=sidebar_canvas.bbox("all"))
+
+def get_parent_ids(person_id):
+    cursor.execute("SELECT DISTINCT related_person_id FROM relationships WHERE person_id = ? AND relationship_type = 'parent'", (person_id,))
+    return [row[0] for row in cursor.fetchall()]
+
+def get_child_ids(person_id):
+    cursor.execute("SELECT person_id FROM relationships WHERE related_person_id = ? AND relationship_type = 'parent'", (person_id,))
+    return [row[0] for row in cursor.fetchall()]
+
+def get_spouse_ids(person_id):
+    cursor.execute("""
+        SELECT related_person_id FROM relationships WHERE person_id = ? AND relationship_type = 'spouse'
+        UNION
+        SELECT person_id FROM relationships WHERE related_person_id = ? AND relationship_type = 'spouse'
+    """, (person_id, person_id))
+    return [row[0] for row in cursor.fetchall()]
+
+def get_person_name(person_id):
+    cursor.execute("SELECT first_name, last_name FROM people WHERE id = ?", (person_id,))
+    row = cursor.fetchone()
+    return f"{row[0]} {row[1]}" if row else "(unknown)"
+
+def link_parent(child_id, parent_id):
+    if len(get_parent_ids(child_id)) >= 2:
+        messagebox.showinfo("Limit reached", "A person can only have 2 linked parents.")
+        return
+    cursor.execute("INSERT INTO relationships (person_id, related_person_id, relationship_type) VALUES (?, ?, ?)", (child_id, parent_id, "parent"))
+    connection.commit()
+    auto_link_spouses_if_needed(child_id, parent_id)
+
+def unlink_parent(child_id, parent_id):
+    cursor.execute("DELETE FROM relationships WHERE person_id = ? AND related_person_id = ? AND relationship_type = 'parent'", (child_id, parent_id))
+    connection.commit()
+
+def link_child(parent_id, child_id):
+    if len(get_parent_ids(child_id)) >= 2:
+        messagebox.showinfo("Limit reached", f"{get_person_name(child_id)} already has 2 linked parents.")
+        return
+    cursor.execute("INSERT INTO relationships (person_id, related_person_id, relationship_type) VALUES (?, ?, ?)", (child_id, parent_id, "parent"))
+    connection.commit()
+    auto_link_spouses_if_needed(child_id, parent_id)
+
+def unlink_child(parent_id, child_id):
+    unlink_parent(child_id, parent_id)
+
+def link_spouse(person_id, spouse_id):
+    cursor.execute("INSERT INTO relationships (person_id, related_person_id, relationship_type) VALUES (?, ?, ?)", (person_id, spouse_id, "spouse"))
+    connection.commit()
+
+def unlink_spouse(person_id, spouse_id):
+    cursor.execute("""
+        DELETE FROM relationships
+        WHERE ((person_id = ? AND related_person_id = ?) OR (person_id = ? AND related_person_id = ?))
+        AND relationship_type = 'spouse'
+    """, (person_id, spouse_id, spouse_id, person_id))
+    connection.commit()
+
+def open_link_window(person_id, x=None, y=None):
+    link_window = tk.Toplevel(window)
+    link_window.attributes("-topmost", True)
+    link_window.title(f"Link/Unlink — {get_person_name(person_id)}")
+
+    if x is not None and y is not None:
+        abs_x = canvas.winfo_rootx() + int(x) + 60
+        abs_y = canvas.winfo_rooty() + int(y) - 100
+        link_window.geometry(f"360x650+{abs_x}+{abs_y}")
+    else:
+        link_window.geometry("360x650")
+
+    container = tk.Frame(link_window)
+    container.pack(fill="both", expand=True, padx=10, pady=10)
+
+    def build_section(title, get_current_ids, on_link, on_unlink):
+        section = tk.LabelFrame(container, text=title, padx=6, pady=6)
+        section.pack(fill="x", pady=(0, 10))
+
+        current_list_frame = tk.Frame(section)
+        current_list_frame.pack(fill="x")
+
+        def refresh_current():
+            for widget in current_list_frame.winfo_children():
+                widget.destroy()
+            current_ids = get_current_ids(person_id)
+            if not current_ids:
+                tk.Label(current_list_frame, text="(none yet)", fg="gray").pack(anchor="w")
+            for other_id in current_ids:
+                chip = tk.Frame(current_list_frame, bg="#e8e8e8", bd=1, relief="solid")
+                chip.pack(fill="x", pady=2)
+
+                tk.Label(chip, text=get_person_name(other_id), anchor="w", bg="#e8e8e8", padx=8, pady=4).pack(side="left", fill="x", expand=True)
+
+                def do_unlink(oid=other_id):
+                    link_window.attributes("-topmost", False)
+                    confirmed = messagebox.askyesno("Unlink?", f"Unlink {get_person_name(oid)}?", parent=link_window)
+                    link_window.attributes("-topmost", True)
+                    if confirmed:
+                        on_unlink(person_id, oid)
+                        refresh_current()
+                        refresh_results(search_entry_local.get())
+                        refresh_tree()
+
+                tk.Button(chip, text="x", width=2, bg="#e8e8e8", relief="flat", command=do_unlink).pack(side="right", padx=4, pady=2)
+
+        search_row = tk.Frame(section)
+        search_row.pack(fill="x", pady=(6, 0))
+
+        sort_state = {"mode": "first"}
+
+        def toggle_sort():
+            sort_state["mode"] = "first" if sort_state["mode"] == "last" else "last"
+            sort_btn.config(text="Sort: First" if sort_state["mode"] == "first" else "Sort: Last")
+            refresh_results(search_entry_local.get())
+
+        sort_btn = tk.Button(search_row, text="Sort: First", command=toggle_sort)
+        sort_btn.pack(side="left")
+
+        search_entry_local = tk.Entry(search_row)
+        search_entry_local.pack(side="left", fill="x", expand=True, padx=4)
+
+        show_all_state = {"expanded": False}
+
+        def toggle_show_all():
+            show_all_state["expanded"] = not show_all_state["expanded"]
+            toggle_btn.config(text="▲" if show_all_state["expanded"] else "▼")
+            refresh_results(search_entry_local.get())
+
+        toggle_btn = tk.Button(search_row, text="▼", width=2, command=toggle_show_all)
+        toggle_btn.pack(side="right")
+
+        results_outer = tk.Frame(section)
+        row_height = 24
+        max_visible_rows = 6
+
+        results_canvas = tk.Canvas(results_outer, height=row_height * max_visible_rows, highlightthickness=0)
+        results_scrollbar = tk.Scrollbar(results_outer, orient="vertical", command=results_canvas.yview)
+        results_canvas.configure(yscrollcommand=results_scrollbar.set)
+
+        results_frame = tk.Frame(results_canvas)
+
+        results_window_id = results_canvas.create_window((0, 0), window=results_frame, anchor="nw")
+
+        def on_results_canvas_resize(event):
+            results_canvas.itemconfig(results_window_id, width=event.width)
+
+        results_canvas.bind("<Configure>", on_results_canvas_resize)
+
+        def on_results_configure(event):
+            results_canvas.configure(scrollregion=results_canvas.bbox("all"))
+
+        results_frame.bind("<Configure>", on_results_configure)
+
+        def on_results_mousewheel(event):
+            results_canvas.yview_scroll(int(-1 * (event.delta / 120)), "units")
+
+        results_canvas.bind("<Enter>", lambda event: results_canvas.bind_all("<MouseWheel>", on_results_mousewheel))
+        results_canvas.bind("<Leave>", lambda event: results_canvas.unbind_all("<MouseWheel>"))
+
+        def refresh_results(filter_text=""):
+            for widget in results_frame.winfo_children():
+                widget.destroy()
+
+            if not filter_text.strip() and not show_all_state["expanded"]:
+                results_outer.pack_forget()
+                return
+
+            results_outer.pack(fill="x")
+            results_canvas.pack(side="left", fill="both", expand=True)
+            results_scrollbar.pack(side="right", fill="y")
+
+            current_ids = get_current_ids(person_id)
+            filter_text = filter_text.strip().lower()
+
+            if sort_state["mode"] == "last":
+                cursor.execute("""
+                    SELECT id, first_name, last_name FROM people
+                    WHERE id != ?
+                    ORDER BY
+                        CASE WHEN last_name IS NULL OR last_name = '' THEN 1 ELSE 0 END,
+                        last_name,
+                        first_name
+                """, (person_id,))
+            else:
+                cursor.execute("""
+                    SELECT id, first_name, last_name FROM people
+                    WHERE id != ?
+                    ORDER BY first_name
+                """, (person_id,))
+
+            for other_id, first, last in cursor.fetchall():
+                if other_id in current_ids:
+                    continue
+                full_name = f"{first} {last}"
+                if filter_text not in full_name.lower():
+                    continue
+                row = tk.Label(results_frame, text=full_name, anchor="w", cursor="hand2", bg="white")
+                row.pack(fill="x", pady=1)
+
+                def do_link(oid=other_id):
+                    on_link(person_id, oid)
+                    refresh_current()
+                    refresh_results(search_entry_local.get())
+                    refresh_tree()
+
+                row.bind("<Button-1>", lambda event, f=do_link: f())
+
+        search_entry_local.bind("<KeyRelease>", lambda event: refresh_results(search_entry_local.get()))
+
+        refresh_current()
+        refresh_results()
+
+    build_section("Parents (max 2)", get_parent_ids, link_parent, unlink_parent)
+    build_section("Children", get_child_ids, link_child, unlink_child)
+    build_section("Spouses", get_spouse_ids, link_spouse, unlink_spouse)
 
 window = tk.Tk()
 window.title("Family Tree")
@@ -1110,15 +1372,13 @@ sidebar_canvas.pack(side="left", fill="both", expand=True, padx=(8, 0), pady=(0,
 sidebar_list_inner = tk.Frame(sidebar_canvas, bg="white")
 sidebar_canvas.create_window((0, 0), window=sidebar_list_inner, anchor="nw")
 
-def on_sidebar_list_configure(event):
-    sidebar_canvas.configure(scrollregion=sidebar_canvas.bbox("all"))
-
 sidebar_list_inner.bind("<Configure>", on_sidebar_list_configure)
 
 info_frame = tk.Frame(window, bg="#eeeeee", bd=2, relief="solid")
 
 info_header = tk.Frame(info_frame, bg="#dddddd")
 info_header.pack(fill="x")
+
 tk.Label(info_header, text="All Informations", bg="#dddddd", font=("Arial", 10, "bold")).pack(side="left", padx=8, pady=4)
 popout_button = tk.Button(info_header, text="⧉", width=2, command=pop_out_info)
 popout_button.pack(side="right", padx=4)
