@@ -22,13 +22,10 @@ PRESET_COLORS = [
     "#7f8c8d",  # Gray
     "#2c3e50",  # Dark
 ]
-last_view_position = None
-last_tree_geometry = None
-current_tree_window = None
+
 tree_zoom = 1.0
 tree_pan_x = 0
 tree_pan_y = 0
-tree_canvas = None
 tree_positions = {}
 pan_start_x = 0
 pan_start_y = 0
@@ -379,17 +376,6 @@ def resize_search_list_frame():
         search_list_frame.place(x=10, y=search_list_y, width=260, relheight=0, height=SEARCH_LIST_HEADER_HEIGHT)
     else:
         search_list_frame.place(x=10, y=search_list_y, width=260, relheight=1, height=-(search_list_y + 10))
-
-def save_window_position():
-    with open("window_position.txt", "w") as file:
-        file.write(window.geometry())
-
-def load_window_position():
-    try:
-        with open("window_position.txt", "r") as file:
-            return file.read().strip()
-    except FileNotFoundError:
-        return None
     
 def add_person(first_name, last_name, birth_date, death_date, sex, notes):
     cursor.execute("""
@@ -420,32 +406,6 @@ def save_person():
     tree_positions = calculate_positions()
     draw_tree()
     refresh_sidebar_list(search_entry.get())
-
-def toggle_parent(person_id, parent_id, var):
-    if var.get():
-        cursor.execute("""
-            INSERT INTO relationships (person_id, related_person_id, relationship_type)
-            VALUES (?, ?, ?)
-        """, (person_id, parent_id, "parent"))
-    else:
-        cursor.execute("""
-            DELETE FROM relationships
-            WHERE person_id = ? AND related_person_id = ? AND relationship_type = 'parent'
-        """, (person_id, parent_id))
-    connection.commit()
-
-def toggle_spouse(person_id, spouse_id, var):
-    if var.get():
-        cursor.execute("""
-            INSERT INTO relationships (person_id, related_person_id, relationship_type)
-            VALUES (?, ?, ?)
-        """, (person_id, spouse_id, "spouse"))
-    else:
-        cursor.execute("""
-            DELETE FROM relationships
-            WHERE person_id = ? AND related_person_id = ? AND relationship_type = 'spouse'
-        """, (person_id, spouse_id))
-    connection.commit()
 
 def update_info_panel(person_id):
     global current_info_person_id
@@ -1067,24 +1027,6 @@ def open_add_parent_window(child_id):
 
     tk.Button(add_window, text="Save New Person", command=save_new_parent).grid(row=current_row + len(labels), column=0, columnspan=2)
 
-def open_view_details_window(person_id):
-    cursor.execute("SELECT first_name, last_name, birth_date, death_date, sex, notes FROM people WHERE id = ?", (person_id,))
-    first_name, last_name, birth_date, death_date, sex, notes = cursor.fetchone()
-
-    details_window = tk.Toplevel(window)
-    details_window.title(f"{first_name} {last_name}")
-    open_near_main(details_window)
-    details_window.geometry("300x250")
-
-    details_window.configure(bg="#cecece")
-
-    tk.Label(details_window, text=f"{first_name} {last_name}", font=("Arial", 14, "bold"), bg="#cecece").pack(pady=(15, 10))
-    tk.Label(details_window, text=f"Born: {birth_date or '—'}", bg="#cecece").pack(anchor="w", padx=20)
-    tk.Label(details_window, text=f"Died: {death_date or '—'}", bg="#cecece").pack(anchor="w", padx=20)
-    tk.Label(details_window, text=f"Sex: {sex or '—'}", bg="#cecece").pack(anchor="w", padx=20)
-    tk.Label(details_window, text="Notes:", font=("Arial", 10, "bold"), bg="#cecece").pack(anchor="w", padx=20, pady=(15, 0))
-    tk.Label(details_window, text=notes or "—", wraplength=250, justify="left", bg="#cecece").pack(anchor="w", padx=20)
-
 def delete_person_from_tree(person_id):
     cursor.execute("SELECT first_name, last_name FROM people WHERE id = ?", (person_id,))
     person = cursor.fetchone()
@@ -1384,117 +1326,6 @@ def open_link_window(person_id, x=None, y=None):
     build_section("Parents (max 2)", get_parent_ids, link_parent, unlink_parent)
     build_section("Children", get_child_ids, link_child, unlink_child)
     build_section("Spouses", get_spouse_ids, link_spouse, unlink_spouse)
-
-def open_manage_tags_window():
-    manage_window = tk.Toplevel(window)
-    manage_window.attributes("-topmost", True)
-    open_near_main(manage_window)
-    manage_window.title("Manage Tags")
-
-    manage_window.grid_columnconfigure(1, weight=1)
-
-    list_frame = tk.Frame(manage_window)
-    list_frame.grid(row=0, column=0, columnspan=4, sticky="nsew", padx=10, pady=10)
-
-    create_frame = tk.Frame(manage_window)
-    create_frame.grid(row=1, column=0, columnspan=4, sticky="ew", padx=10, pady=(0, 10))
-
-    tk.Label(create_frame, text="New tag name:").grid(row=0, column=0, sticky="w")
-    new_tag_entry = tk.Entry(create_frame)
-    new_tag_entry.grid(row=1, column=0, sticky="ew", pady=4)
-    create_frame.grid_columnconfigure(0, weight=1)
-
-    tk.Label(create_frame, text="Color:").grid(row=0, column=1, sticky="w", padx=(10, 0))
-    color_swatch_frame = tk.Frame(create_frame)
-    color_swatch_frame.grid(row=1, column=1, sticky="w", padx=(10, 0))
-
-    selected_color = tk.StringVar(value=PRESET_COLORS[0])
-
-    def select_color(color):
-        selected_color.set(color)
-        for swatch, c in swatch_widgets:
-            swatch.config(relief="sunken" if c == color else "raised")
-
-    swatch_widgets = []
-    for i, color in enumerate(PRESET_COLORS):
-        swatch = tk.Label(color_swatch_frame, bg=color, width=2, height=1, relief="raised", cursor="hand2")
-        swatch.grid(row=0, column=i, padx=1)
-        swatch.bind("<Button-1>", lambda e, c=color: select_color(c))
-        swatch_widgets.append((swatch, color))
-
-    select_color(PRESET_COLORS[0])
-
-    def create_new_tag():
-        name = new_tag_entry.get().strip()
-        if name.startswith("#"):
-            name = name[1:]
-        if not name:
-            return
-
-        existing = search_tags(connection, name)
-        exact_match = next((t for t in existing if t[1].lower() == name.lower()), None)
-
-        if exact_match:
-            messagebox.showinfo("Tag exists", f"{name} already exists.")
-            return
-
-        get_or_create_tag(connection, name, selected_color.get())
-        new_tag_entry.delete(0, tk.END)
-        refresh_tag_list()
-
-    tk.Button(create_frame, text="Create Tag", command=create_new_tag).grid(row=1, column=2, padx=(10, 0))
-
-    def refresh_tag_list():
-        for widget in list_frame.winfo_children():
-            widget.destroy()
-
-        tags = get_all_tags(connection)
-
-        for row_index, (tag_id, name, color, usage_count) in enumerate(tags):
-            text_color = get_contrasting_text_color(color)
-
-            chip = tk.Label(
-                list_frame, text=name, bg=color, fg=text_color,
-                padx=8, pady=4
-            )
-            chip.grid(row=row_index, column=0, sticky="w", padx=5, pady=3)
-
-            count_label = tk.Label(
-                list_frame, text=f"used by {usage_count} people",
-                fg="blue", cursor="hand2"
-            )
-            count_label.grid(row=row_index, column=1, sticky="w", padx=5)
-            count_label.bind(
-                "<Button-1>",
-                lambda event, tid=tag_id, n=name: open_view_tagged_people(tid, n, refresh_tag_list)
-            )
-
-            delete_btn = tk.Button(
-                list_frame, text="Delete Tag",
-                command=lambda tid=tag_id, n=name, c=usage_count: confirm_delete_tag(tid, n, c)
-            )
-            delete_btn.grid(row=row_index, column=2, padx=5)
-
-            add_people_btn = tk.Button(
-                list_frame, text="Add People",
-                command=lambda tid=tag_id, n=name: open_link_people_to_tag(tid, n, refresh_tag_list)
-            )
-            add_people_btn.grid(row=row_index, column=3, padx=5)
-
-    def confirm_delete_tag(tag_id, name, usage_count):
-        confirmed = messagebox.askyesno(
-            "Delete Tag",
-            f"Delete {name} completely? It is currently used by {usage_count} people "
-            f"and will be removed from all of them. This cannot be undone."
-        )
-        if confirmed:
-            delete_tag_completely(connection, tag_id)
-            refresh_tag_list()
-
-    refresh_tag_list()
-
-    grip = ResizeGrip(manage_window, manage_window)
-    grip.place(relx=1.0, rely=1.0, anchor="se")
 
 def open_view_tagged_people(tag_id, tag_name, on_change=None):
     global tag_subwindow
