@@ -3,6 +3,8 @@ import tkinter as tk
 import math
 
 from tkinter import messagebox
+from grandalf.graphs import Vertex, Edge, Graph
+from grandalf.layouts import SugiyamaLayout
 
 
 connection = sqlite3.connect("family_tree.db")
@@ -46,6 +48,8 @@ current_info_person_id = None
 suppress_next_clear = False
 tag_subwindow = None
 
+SPOUSE_TIER_OFFSET = 20
+
 
 cursor.execute("""
     CREATE TABLE IF NOT EXISTS people (
@@ -87,6 +91,12 @@ cursor.execute("""
         FOREIGN KEY (tag_id) REFERENCES tags(id) ON DELETE CASCADE
     )
 """)
+
+try:
+    cursor.execute("ALTER TABLE relationships ADD COLUMN order_rank INTEGER")
+    connection.commit()
+except sqlite3.OperationalError:
+    pass  # column already exists
 
 connection.commit()
 
@@ -317,6 +327,13 @@ class TagFlowView(tk.Frame):
         self.inner.config(height=total_height)
         self.canvas.configure(scrollregion=(0, 0, width, total_height))
 
+class _NodeView:
+    def __init__(self, w=150, h=150):
+        self.w = w
+        self.h = h
+        self.xy = (0, 0)
+
+
 
 def toggle_add_person():
     global add_person_collapsed
@@ -443,10 +460,17 @@ def calculate_generations():
     cursor.execute("SELECT id FROM people")
     all_ids = [row[0] for row in cursor.fetchall()]
 
+    cursor.execute("SELECT id, birth_date FROM people")
+    birth_lookup = {row[0]: row[1] for row in cursor.fetchall()}
+
     generations = {}
 
     cursor.execute("SELECT person_id, related_person_id FROM relationships WHERE relationship_type = 'parent'")
     parent_links = cursor.fetchall()
+
+    real_parents_of_person = {}
+    for child_id, parent_id in parent_links:
+        real_parents_of_person.setdefault(child_id, []).append(parent_id)
 
     cursor.execute("SELECT person_id, related_person_id FROM relationships WHERE relationship_type = 'spouse'")
     spouse_links = cursor.fetchall()
@@ -479,84 +503,160 @@ def calculate_generations():
     return generations
 
 def calculate_positions():
-    generations = calculate_generations()
+    cursor.execute("SELECT id FROM people")
+    all_ids = [row[0] for row in cursor.fetchall()]
 
-    cursor.execute("SELECT DISTINCT person_id FROM relationships UNION SELECT DISTINCT related_person_id FROM relationships")
-    connected_ids = {row[0] for row in cursor.fetchall()}
-
-    cursor.execute("SELECT person_id, related_person_id FROM relationships WHERE relationship_type = 'spouse'")
-    spouse_links = cursor.fetchall()
-    spouse_of = {}
-    for a, b in spouse_links:
-        spouse_of[a] = b
-        spouse_of[b] = a
+    cursor.execute("SELECT id, birth_date FROM people")
+    birth_lookup = {row[0]: row[1] for row in cursor.fetchall()}
 
     cursor.execute("SELECT person_id, related_person_id FROM relationships WHERE relationship_type = 'parent'")
     parent_links = cursor.fetchall()
-    parents_of = {}
+
+    real_parents_of_person = {}
     for child_id, parent_id in parent_links:
-        parents_of.setdefault(child_id, []).append(parent_id)
+        real_parents_of_person.setdefault(child_id, []).append(parent_id)
 
-    people_by_generation = {}
-    unconnected_ids = []
+    cursor.execute("SELECT person_id, related_person_id FROM relationships WHERE relationship_type = 'spouse'")
+    spouse_links = cursor.fetchall()
 
-    for person_id, gen in generations.items():
-        if person_id in connected_ids:
-            people_by_generation.setdefault(gen, []).append(person_id)
-        else:
-            unconnected_ids.append(person_id)
+    connected_ids = set()
+    for child_id, parent_id in parent_links:
+        connected_ids.add(child_id)
+        connected_ids.add(parent_id)
+    for a, b in spouse_links:
+        connected_ids.add(a)
+        connected_ids.add(b)
+
+    unconnected_ids = [pid for pid in all_ids if pid not in connected_ids]
+
+    # merge spouses into units, supporting any number of spouses per person
+    parent_uf = {pid: pid for pid in connected_ids}
+
+    def find(x):
+        while parent_uf[x] != x:
+            parent_uf[x] = parent_uf[parent_uf[x]]
+            x = parent_uf[x]
+        return x
+
+    def union(x, y):
+        rx, ry = find(x), find(y)
+        if rx != ry:
+            parent_uf[ry] = rx
+
+    for a, b in spouse_links:
+        union(a, b)
+
+    groups = {}
+    for pid in connected_ids:
+        groups.setdefault(find(pid), []).append(pid)
+
+    unit_of = {}
+    units = set()
+    for members in groups.values():
+        unit = frozenset(members)
+        units.add(unit)
+        for m in members:
+            unit_of[m] = unit
+
+    cursor.execute("SELECT person_id, related_person_id, order_rank FROM relationships WHERE relationship_type = 'spouse'")
+    rank_lookup = {(pid, sid): rank for pid, sid, rank in cursor.fetchall()}
+
+    NODE_WIDTH = 150          # must match the offset * 150 used when drawing spouses
+    UNIT_GAP = 30             # extra breathing room between neighboring units
+
+    def unit_width(unit):
+        # a single person takes one node-width, each extra member (spouse) adds another
+        return len(unit) * NODE_WIDTH + UNIT_GAP
+
+    unit_parent_links = set()
+    for child_id, parent_id in parent_links:
+        unit_parent_links.add((unit_of[parent_id], unit_of[child_id]))
+
+    children_of_unit = {}
+    parents_of_unit = {}
+    for pu, cu in unit_parent_links:
+        children_of_unit.setdefault(pu, set()).add(cu)
+        parents_of_unit.setdefault(cu, set()).add(pu)
+
+    descendant_count_cache = {}
+    def count_descendants(unit):
+        if unit in descendant_count_cache:
+            return descendant_count_cache[unit]
+        total = 0
+        for child_unit in children_of_unit.get(unit, ()):
+            total += 1 + count_descendants(child_unit)
+        descendant_count_cache[unit] = total
+        return total
+
+    for unit in units:
+        count_descendants(unit)
+
+    def order_by_birth(unit_list):
+        def oldest_key(unit):
+            keys = [birth_sort_key(m, birth_lookup) for m in unit]
+            return min(keys)
+        return sorted(unit_list, key=oldest_key)
+
+    vertices = {unit: Vertex(unit) for unit in units}
+    for unit, v in vertices.items():
+        v.view = _NodeView(unit_width(unit), 150)
+
+    edges = [Edge(vertices[pu], vertices[cu]) for pu, cu in unit_parent_links]
 
     positions = {}
-    horizontal_spacing = 150
-    vertical_spacing = 150
+    vertical_spacing = 300
 
-    sorted_gens = sorted(people_by_generation.keys())
+    generations = {}
+    if all_ids:
+        generations[all_ids[0]] = 0
+    changed = True
+    while changed:
+        changed = False
+        for child_id, parent_id in parent_links:
+            if child_id in generations and parent_id not in generations:
+                generations[parent_id] = generations[child_id] - 1
+                changed = True
+            elif parent_id in generations and child_id not in generations:
+                generations[child_id] = generations[parent_id] + 1
+                changed = True
+        for a, b in spouse_links:
+            if a in generations and b not in generations:
+                generations[b] = generations[a]
+                changed = True
+            elif b in generations and a not in generations:
+                generations[a] = generations[b]
+                changed = True
 
-    for gen in sorted_gens:
-        person_ids = people_by_generation[gen]
+    if vertices:
+        g = Graph(list(vertices.values()), edges)
+        x_offset = 0
+        for comp in g.C:
+            sug = SugiyamaLayout(comp)
+            sug.init_all()
+            sug.draw()
 
-        units = []
-        seen = set()
-        for person_id in person_ids:
-            if person_id in seen:
-                continue
-            unit = [person_id]
-            seen.add(person_id)
-            partner = spouse_of.get(person_id)
-            if partner in person_ids and partner not in seen:
-                unit.append(partner)
-                seen.add(partner)
-            units.append(unit)
+            comp_units = [v.data for v in comp.sV]
 
-        unit_targets = []
-        for unit in units:
-            parent_xs = []
-            for member in unit:
-                for parent_id in parents_of.get(member, []):
-                    if parent_id in positions:
-                        parent_xs.append(positions[parent_id][0])
-            target_x = sum(parent_xs) / len(parent_xs) if parent_xs else None
-            unit_targets.append(target_x)
+            for v in comp.sV:
+                unit = v.data
+                cx, cy = v.view.xy
+                layout = get_unit_layout(unit, spouse_links, rank_lookup)
+                total_w = len(layout) * NODE_WIDTH
+                start = cx - total_w / 2 + NODE_WIDTH / 2
+                for offset, (member, tier) in enumerate(layout):
+                    positions[member] = (
+                        x_offset + start + offset * NODE_WIDTH,
+                        cy + tier * SPOUSE_TIER_OFFSET,
+                    )
 
-        with_target = [(unit_targets[i], i) for i in range(len(units)) if unit_targets[i] is not None]
-        without_target = [i for i in range(len(units)) if unit_targets[i] is None]
-        with_target.sort()
-        order = [i for _, i in with_target] + without_target
-
-        next_free_x = 100
-        for i in order:
-            unit = units[i]
-            target_x = unit_targets[i]
-            desired_x = target_x if target_x is not None else next_free_x
-            start_x = max(desired_x, next_free_x)
-            for offset, member in enumerate(unit):
-                x = start_x + offset * horizontal_spacing
-                y = gen * vertical_spacing + 300
-                positions[member] = (x, y)
-            next_free_x = start_x + len(unit) * horizontal_spacing
+            comp_max_x = max(
+                v.view.xy[0] + unit_width(v.data) / 2
+                for v in comp.sV
+            )
+            x_offset += comp_max_x + 450
 
     for index, person_id in enumerate(unconnected_ids):
-        x = index * horizontal_spacing + 100
+        x = index * 150 + 100
         y = 700
         positions[person_id] = (x, y)
 
@@ -672,6 +772,11 @@ def draw_tree():
     cursor.execute("SELECT person_id, related_person_id FROM relationships WHERE relationship_type = 'spouse'")
     spouse_links = cursor.fetchall()
 
+    spouse_degree = {}
+    for a, b in spouse_links:
+        spouse_degree[a] = spouse_degree.get(a, 0) + 1
+        spouse_degree[b] = spouse_degree.get(b, 0) + 1
+
     drawn_spouse_pairs = set()
     for person_id, spouse_id in spouse_links:
         pair = frozenset((person_id, spouse_id))
@@ -681,7 +786,10 @@ def draw_tree():
         if person_id in tree_positions and spouse_id in tree_positions:
             x1, y1 = get_screen_position(person_id)
             x2, y2 = get_screen_position(spouse_id)
-            canvas.create_line(x1, y1, x2, y2, fill="#d17b7b", width=2, dash=(4, 2))
+            if y1 == y2:
+                canvas.create_line(x1, y1, x2, y2, fill="#d17b7b", width=2, dash=(4, 2))
+            else:
+                canvas.create_line(x1, y1, x1, y2, x2, y2, fill="#d17b7b", width=2, dash=(4, 2))
 
     cursor.execute("SELECT person_id, related_person_id FROM relationships WHERE relationship_type = 'parent'")
     parent_links = cursor.fetchall()
@@ -696,12 +804,25 @@ def draw_tree():
         children_of_couple.setdefault(couple_key, []).append(child_id)
 
     for couple_key, children in children_of_couple.items():
-        parent_positions = [get_screen_position(pid) for pid in couple_key if pid in tree_positions]
-        if not parent_positions:
+        parent_ids = [pid for pid in couple_key if pid in tree_positions]
+        if not parent_ids:
             continue
 
-        anchor_x = sum(p[0] for p in parent_positions) / len(parent_positions)
-        anchor_y = sum(p[1] for p in parent_positions) / len(parent_positions)
+        parent_logical = [tree_positions[pid] for pid in parent_ids]
+        anchor_logical_x = sum(p[0] for p in parent_logical) / len(parent_logical)
+        anchor_logical_y = max(p[1] for p in parent_logical)
+
+        # nudge aside if this exact point coincides with someone uninvolved
+        collision_radius = 60
+        for other_id, (ox, oy) in tree_positions.items():
+            if other_id in couple_key:
+                continue
+            if abs(ox - anchor_logical_x) < collision_radius and abs(oy - anchor_logical_y) < collision_radius:
+                anchor_logical_x += collision_radius
+                break
+
+        anchor_x = anchor_logical_x * tree_zoom + tree_pan_x
+        anchor_y = anchor_logical_y * tree_zoom + tree_pan_y
 
         child_positions = [(cid, get_screen_position(cid)) for cid in children if cid in tree_positions]
         if not child_positions:
@@ -722,7 +843,7 @@ def draw_tree():
             canvas.create_line(
                 *points,
                 fill=line_color, width=line_width,
-                capstyle="round", smooth=True, splinesteps=12
+                capstyle="round"
             )
 
     cursor.execute("SELECT id, first_name, last_name, sex FROM people")
@@ -857,10 +978,11 @@ def open_add_spouse_window(person_id):
 
         def link_existing():
             spouse_id = int(selected_option.get().split(" - ")[0])
+            next_rank = get_next_spouse_rank(person_id)
             cursor.execute("""
-                INSERT INTO relationships (person_id, related_person_id, relationship_type)
-                VALUES (?, ?, ?)
-            """, (person_id, spouse_id, "spouse"))
+                INSERT INTO relationships (person_id, related_person_id, relationship_type, order_rank)
+                VALUES (?, ?, ?, ?)
+            """, (person_id, spouse_id, "spouse", next_rank))
             connection.commit()
             add_window.destroy()
             refresh_tree()
@@ -915,10 +1037,11 @@ def open_add_spouse_window(person_id):
             VALUES (?, ?, ?, ?, ?, ?)
         """, tuple(values))
         new_spouse_id = cursor.lastrowid
+        next_rank = get_next_spouse_rank(person_id)
         cursor.execute("""
-            INSERT INTO relationships (person_id, related_person_id, relationship_type)
-            VALUES (?, ?, ?)
-        """, (person_id, new_spouse_id, "spouse"))
+            INSERT INTO relationships (person_id, related_person_id, relationship_type, order_rank)
+            VALUES (?, ?, ?, ?)
+        """, (person_id, new_spouse_id, "spouse", next_rank))
         connection.commit()
         add_window.destroy()
         refresh_tree()
@@ -1030,7 +1153,13 @@ def open_add_parent_window(child_id):
 def delete_person_from_tree(person_id):
     cursor.execute("SELECT first_name, last_name FROM people WHERE id = ?", (person_id,))
     person = cursor.fetchone()
-    confirmed = messagebox.askyesno("Confirm Delete", f"Are you sure you want to delete {person[0]} {person[1]}?")
+    if not person:
+       return  # person doesn't exist anymore, nothing to delete
+    confirmed = messagebox.askyesno(
+        "Confirm Delete",
+        f"Delete {person[0]} {person[1]} from the family tree?"
+    )
+
     if confirmed:
         cursor.execute("DELETE FROM relationships WHERE person_id = ? OR related_person_id = ?", (person_id, person_id))
         cursor.execute("DELETE FROM people WHERE id = ?", (person_id,))
@@ -1185,7 +1314,7 @@ def open_link_window(person_id, x=None, y=None):
     container = tk.Frame(link_window)
     container.pack(fill="both", expand=True, padx=10, pady=10)
 
-    def build_section(title, get_current_ids, on_link, on_unlink):
+    def build_section(title, get_current_ids, on_link, on_unlink, orderable=False, on_move=None):
         section = tk.LabelFrame(container, text=title, padx=6, pady=6)
         section.pack(fill="x", pady=(0, 10))
 
@@ -1203,6 +1332,15 @@ def open_link_window(person_id, x=None, y=None):
                 chip.pack(fill="x", pady=2)
 
                 tk.Label(chip, text=get_person_name(other_id), anchor="w", bg="#e8e8e8", padx=8, pady=4).pack(side="left", fill="x", expand=True)
+
+                if orderable:
+                    def do_move(oid=other_id, direction="up"):
+                        on_move(person_id, oid, direction)
+                        refresh_current()
+                        refresh_tree()
+
+                    tk.Button(chip, text="▲", width=2, bg="#e8e8e8", relief="flat", command=lambda oid=other_id: do_move(oid, "up")).pack(side="right", padx=1)
+                    tk.Button(chip, text="▼", width=2, bg="#e8e8e8", relief="flat", command=lambda oid=other_id: do_move(oid, "down")).pack(side="right", padx=1)
 
                 def do_unlink(oid=other_id):
                     link_window.attributes("-topmost", False)
@@ -1325,7 +1463,7 @@ def open_link_window(person_id, x=None, y=None):
 
     build_section("Parents (max 2)", get_parent_ids, link_parent, unlink_parent)
     build_section("Children", get_child_ids, link_child, unlink_child)
-    build_section("Spouses", get_spouse_ids, link_spouse, unlink_spouse)
+    build_section("Spouses", get_spouse_ids_ordered, link_spouse, unlink_spouse, orderable=True, on_move=move_spouse_rank)
 
 def open_view_tagged_people(tag_id, tag_name, on_change=None):
     global tag_subwindow
@@ -1592,6 +1730,131 @@ def get_spouse_ids(person_id):
        """, (person_id, person_id))
        return [row[0] for row in cursor.fetchall()]
 
+def get_next_spouse_rank(person_id):
+    cursor.execute("""
+        SELECT MAX(order_rank) FROM relationships
+        WHERE person_id = ? AND relationship_type = 'spouse'
+    """, (person_id,))
+    max_rank = cursor.fetchone()[0]
+    return (max_rank or 0) + 1
+
+def get_spouse_ids_ordered(person_id):
+    cursor.execute("""
+        SELECT related_person_id, order_rank FROM relationships
+        WHERE person_id = ? AND relationship_type = 'spouse'
+    """, (person_id,))
+    forward = cursor.fetchall()
+
+    cursor.execute("""
+        SELECT person_id, order_rank FROM relationships
+        WHERE related_person_id = ? AND relationship_type = 'spouse'
+    """, (person_id,))
+    backward = cursor.fetchall()
+
+    combined = forward + backward
+    combined.sort(key=lambda row: (row[1] is None, row[1]))
+    return [spouse_id for spouse_id, rank in combined]
+
+def move_spouse_rank(person_id, spouse_id, direction):
+    ordered = get_spouse_ids_ordered(person_id)
+    if spouse_id not in ordered:
+        return
+    index = ordered.index(spouse_id)
+    swap_index = index - 1 if direction == "up" else index + 1
+    if swap_index < 0 or swap_index >= len(ordered):
+        return
+    other_id = ordered[swap_index]
+
+    cursor.execute("""
+        SELECT id, order_rank FROM relationships
+        WHERE person_id = ? AND related_person_id = ? AND relationship_type = 'spouse'
+    """, (person_id, spouse_id))
+    row1 = cursor.fetchone()
+
+    cursor.execute("""
+        SELECT id, order_rank FROM relationships
+        WHERE person_id = ? AND related_person_id = ? AND relationship_type = 'spouse'
+    """, (person_id, other_id))
+    row2 = cursor.fetchone()
+
+    if not row1 or not row2:
+        messagebox.showinfo("Can't reorder", "Reordering only works for spouses linked directly from this person's own window.")
+        return
+
+    cursor.execute("UPDATE relationships SET order_rank = ? WHERE id = ?", (row2[1], row1[0]))
+    cursor.execute("UPDATE relationships SET order_rank = ? WHERE id = ?", (row1[1], row2[0]))
+    connection.commit()
+
+def parse_birth_date(text):
+    """Turns a birth_date string into a sortable tuple (year, month, day).
+    Accepts 'DD.MM.YYYY', 'MM.YYYY', 'YYYY', or anything unparseable/empty."""
+    if not text:
+        return None
+    parts = str(text).strip().split(".")
+    try:
+        numbers = [int(p) for p in parts]
+    except ValueError:
+        return None
+    if len(numbers) == 3:
+        day, month, year = numbers
+        return (year, month, day)
+    if len(numbers) == 2:
+        month, year = numbers
+        return (year, month, 15)
+    if len(numbers) == 1:
+        return (numbers[0], 6, 15)
+    return None
+
+def birth_sort_key(person_id, birth_lookup):
+    """Sort key for one person. People without any date sort last."""
+    parsed = parse_birth_date(birth_lookup.get(person_id))
+    if parsed is None:
+        return (9999, 12, 31)
+    return parsed
+
+def get_person_sex(person_id):
+    cursor.execute("SELECT sex FROM people WHERE id = ?", (person_id,))
+    row = cursor.fetchone()
+    return (row[0] or "").strip().lower() if row else ""
+
+def get_unit_layout(unit, spouse_links, rank_lookup):
+    """Returns [(person_id, tier), ...] — tier 0 = anchor row,
+    tier 1/2/3... = each additional spouse's vertical stagger."""
+    members = list(unit)
+
+    if len(members) == 1:
+        return [(members[0], 0)]
+
+    if len(members) == 2:
+        a, b = members
+        sex_a, sex_b = get_person_sex(a), get_person_sex(b)
+        if sex_a == "male" and sex_b != "male":
+            ordered = [a, b]
+        elif sex_b == "male" and sex_a != "male":
+            ordered = [b, a]
+        else:
+            ordered = sorted(members, key=lambda pid: (
+                rank_lookup.get((a, pid), rank_lookup.get((b, pid), 999)) or 999, pid
+            ))
+        return [(ordered[0], 0), (ordered[1], 0)]
+
+    degree = {m: 0 for m in members}
+    for a, b in spouse_links:
+        if a in unit and b in unit:
+            degree[a] += 1
+            degree[b] += 1
+    anchor = max(members, key=lambda m: (degree[m], -m))
+    others = [m for m in members if m != anchor]
+
+    def rank_of(spouse):
+        return rank_lookup.get((anchor, spouse), rank_lookup.get((spouse, anchor), 999)) or 999
+
+    others_sorted = sorted(others, key=lambda s: (rank_of(s), s))
+    result = [(anchor, 0)]
+    for i, spouse_id in enumerate(others_sorted):
+        result.append((spouse_id, i))
+    return result
+
 def get_person_name(person_id):
     cursor.execute("SELECT first_name, last_name FROM people WHERE id = ?", (person_id,))
     row = cursor.fetchone()
@@ -1621,7 +1884,8 @@ def unlink_child(parent_id, child_id):
     unlink_parent(child_id, parent_id)
 
 def link_spouse(person_id, spouse_id):
-    cursor.execute("INSERT INTO relationships (person_id, related_person_id, relationship_type) VALUES (?, ?, ?)", (person_id, spouse_id, "spouse"))
+    next_rank = get_next_spouse_rank(person_id)
+    cursor.execute("INSERT INTO relationships (person_id, related_person_id, relationship_type, order_rank) VALUES (?, ?, ?, ?)", (person_id, spouse_id, "spouse", next_rank))
     connection.commit()
 
 def unlink_spouse(person_id, spouse_id):
